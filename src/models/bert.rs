@@ -1,4 +1,4 @@
-use std::{cell::RefCell, rc::Rc};
+use std::rc::Rc;
 
 use candle::{Device, Tensor};
 use candle_nn::VarBuilder;
@@ -66,44 +66,31 @@ impl BertModelWrapper {
         let token_ids = Tensor::new(tokens.get_ids(), &self.device)?.unsqueeze(0)?;
         let token_type_ids = token_ids.zeros_like()?;
         let start = std::time::Instant::now();
-        let embeddings = self.model.forward(&token_ids, &token_type_ids)?;
+        let embeddings = self.model.forward(&token_ids, &token_type_ids, None)?;
         debug!("time taken for forward: {:?}", start.elapsed());
         debug!("embeddings: {:?}", embeddings);
-        let embeddings = Self::apply_max_pooling(&embeddings)?;
+        let embeddings = Self::apply_mean_pooling(&embeddings)?;
         debug!("embeddings after pooling: {:?}", embeddings);
         let embeddings = Self::l2_normalize(&embeddings)?;
         Ok(embeddings)
     }
 
     pub fn embed_sentences(&self, sentences: &[&str], apply_mean: bool) -> anyhow::Result<Tensor> {
-        let mut all_tokens = Vec::with_capacity(sentences.len());
+        if sentences.is_empty() {
+            anyhow::bail!("Cannot embed an empty list of sentences");
+        }
+
+        let mut sentence_embeddings = Vec::with_capacity(sentences.len());
         for sentence in sentences {
-            let tokens = self
-                .tokenizer
-                .encode(*sentence, true)
-                .map_err(anyhow::Error::msg)?;
-            all_tokens.push(tokens);
+            let embedding = self.embed_sentence(sentence)?;
+            sentence_embeddings.push(embedding.squeeze(0)?.to_vec1::<f32>()?);
         }
 
-        let batch_size = sentences.len();
-        let max_length = all_tokens[0].get_ids().len(); // Assuming all are padded to the same length
-
-        let mut token_ids = Vec::with_capacity(batch_size * max_length);
-        let mut attention_mask = Vec::with_capacity(batch_size * max_length);
-
-        for tokens in all_tokens {
-            token_ids.extend_from_slice(tokens.get_ids());
-            attention_mask.extend_from_slice(tokens.get_attention_mask());
-        }
-
-        let token_ids = Tensor::new(token_ids, &self.device)?.reshape((batch_size, max_length))?;
-        let token_type_ids = token_ids.zeros_like()?;
-        let embeddings = self.model.forward(&token_ids, &token_type_ids)?;
-        let embeddings = Self::apply_mean_pooling(&embeddings)?;
-        let embeddings = Self::l2_normalize(&embeddings)?;
+        let embeddings = Tensor::new(sentence_embeddings, &self.device)?;
         if apply_mean {
             let embeddings = Self::apply_mean_pooling(&embeddings)?;
-            Ok(embeddings)
+            let norm = embeddings.sqr()?.sum_all()?.sqrt()?;
+            Ok(embeddings.broadcast_div(&norm)?)
         } else {
             Ok(embeddings)
         }
@@ -136,6 +123,7 @@ impl BertModelWrapper {
         Ok(normalized)
     }
 
+    #[cfg(test)]
     fn cosine_similarity(a: &Tensor, b: &Tensor) -> anyhow::Result<f64> {
         let sum_ij = (a * b)?.sum_all()?.to_scalar::<f64>()?;
         let sum_i2 = (a * a)?.sum_all()?.to_scalar::<f64>()?;

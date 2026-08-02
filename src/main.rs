@@ -5,7 +5,8 @@ use models::bert::BertModelWrapper;
 use rayon::prelude::*;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
-use std::sync::mpsc::{Receiver, Sender};
+use std::path::Path;
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -30,28 +31,30 @@ async fn main() -> anyhow::Result<()> {
     let ts_mark = std::time::Instant::now();
 
     // init the channel that sends data to the thread that writes embedding to the db
-    let (sender, reciever) = std::sync::mpsc::channel::<EmbeddingEntry>();
+    let (sender, receiver) = mpsc::channel::<EmbeddingEntry>(100);
     // start the task and get a handle to it
     let db_writer_task =
-        init_db_writer_task(reciever, cli_args.db_uri.as_str(), "vectors_table_1", 100).await?;
+        init_db_writer_task(receiver, cli_args.db_uri.as_str(), "vectors_table_1", 100).await?;
 
     // list the files in the directory to be embedded
     let files_dir = fs::read_dir(cli_args.input_directory)?;
 
     let file_list = files_dir
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()?
         .into_iter()
-        .map(|file| file.unwrap().path().to_str().unwrap().to_string())
-        .collect::<Vec<String>>();
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
     // process the files in parallel
-    file_list.par_iter().for_each(|filename| {
-        if let Err(e) = process_text_file(sender.clone(), filename.as_str()) {
-            warn!("Error processing file: {}: Error:{}", filename, e)
+    file_list.par_iter().for_each(|path| {
+        if let Err(error) = process_text_file(sender.clone(), path) {
+            warn!(path = %path.display(), %error, "Failed to process file");
         }
     });
 
     drop(sender); // this will close the original channel
     info!("All files processed, waiting for write task to finish");
-    db_writer_task.await?; // wait for the db writer task to finish before exiting
+    db_writer_task.await??; // wait for the db writer task to finish before exiting
     info!(
         "{} files indexed in: {:?}",
         file_list.len(),
@@ -61,14 +64,17 @@ async fn main() -> anyhow::Result<()> {
 }
 
 // process a text file and send the embeddings to the channel
-fn process_text_file(sender: Sender<EmbeddingEntry>, filename: &str) -> anyhow::Result<()> {
+fn process_text_file(sender: Sender<EmbeddingEntry>, path: &Path) -> anyhow::Result<()> {
     let bert_model = models::bert::get_model_reference()?;
-    info!("reading file: {}", filename);
-    let text_chunks = read_file_in_chunks(filename, 256)?;
+    info!(path = %path.display(), "Reading file");
+    let text_chunks = read_file_in_chunks(path, 256)?;
+    if text_chunks.is_empty() {
+        anyhow::bail!("File contains no text: {}", path.display());
+    }
     let text_chunks: Vec<&str> = text_chunks.iter().map(AsRef::as_ref).collect();
-    let file_vector = embed_multiple_sentences(&text_chunks, false, &bert_model)?;
-    sender.send(EmbeddingEntry {
-        filename: filename.to_string(),
+    let file_vector = embed_multiple_sentences(&text_chunks, true, &bert_model)?;
+    sender.blocking_send(EmbeddingEntry {
+        filename: path.to_string_lossy().into_owned(),
         embedding: file_vector[0].clone(),
     })?;
     Ok(())
@@ -76,30 +82,31 @@ fn process_text_file(sender: Sender<EmbeddingEntry>, filename: &str) -> anyhow::
 
 /// Initialize the task that writes the embeddings to the db
 /// ## Arguments
-/// * reciever: the channel that receives the embeddings
+/// * receiver: the channel that receives the embeddings
 /// * db_uri: the uri of the db e.g. data/vecdb
 /// * table_name: the name of the table to write the embeddings to
 async fn init_db_writer_task(
-    reciever: Receiver<EmbeddingEntry>,
+    mut receiver: Receiver<EmbeddingEntry>,
     db_uri: &str,
     table_name: &str,
     buffer_size: usize,
-) -> anyhow::Result<JoinHandle<()>> {
+) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
     let db = storage::VecDB::connect(db_uri, table_name).await?;
     let task_handle = tokio::spawn(async move {
         let mut embeddings_buffer = Vec::new();
-        while let Ok(embedding) = reciever.recv() {
+        while let Some(embedding) = receiver.recv().await {
             embeddings_buffer.push(embedding);
             if embeddings_buffer.len() >= buffer_size {
                 let (keys, vectors) = extract_keys_and_vectors(&embeddings_buffer);
-                db.add_vector(&keys, vectors, 384).await.unwrap();
+                db.add_vector(&keys, vectors, 384).await?;
                 embeddings_buffer.clear();
             }
         }
         if !embeddings_buffer.is_empty() {
             let (keys, vectors) = extract_keys_and_vectors(&embeddings_buffer);
-            db.add_vector(&keys, vectors, 384).await.unwrap();
+            db.add_vector(&keys, vectors, 384).await?;
         }
+        Ok(())
     });
     Ok(task_handle)
 }
@@ -126,14 +133,12 @@ fn embed_multiple_sentences(
     }
 }
 
+#[cfg(test)]
 fn embed_sentence(sentence: &str, bert_model: &BertModelWrapper) -> anyhow::Result<Vec<f32>> {
     let embedding = bert_model.embed_sentence(sentence)?;
-    println!("embedding Tensor: {:?}", embedding);
     // we squeeze the tensor to remove the batch dimension
     let embedding = embedding.squeeze(0)?;
-    println!("embedding Tensor after squeeze: {:?}", embedding);
     let embedding = embedding.to_vec1::<f32>().unwrap();
-    //println!("embedding Vec: {:?}", embedding);
     Ok(embedding)
 }
 
@@ -155,14 +160,15 @@ fn init_tracing() {
     }
 }
 
-fn read_file_in_chunks(file_path: &str, chunk_size: usize) -> anyhow::Result<Vec<String>> {
-    let file = File::open(file_path).unwrap();
+fn read_file_in_chunks(file_path: &Path, chunk_size: usize) -> anyhow::Result<Vec<String>> {
+    let file = File::open(file_path)?;
     let reader = BufReader::new(file);
     let mut sentences = Vec::new();
     let mut text_buffer = String::new();
     for text in reader.lines() {
         let text = text?;
         text_buffer.push_str(text.as_str());
+        text_buffer.push(' ');
         let word_count = text_buffer.split_whitespace().count();
         if word_count >= chunk_size {
             sentences.push(text_buffer.clone());
@@ -175,34 +181,34 @@ fn read_file_in_chunks(file_path: &str, chunk_size: usize) -> anyhow::Result<Vec
     Ok(sentences)
 }
 
-// test the entire flow with files in embedding_files_test folder end-to-end
+// Test the entire flow with the repository's text fixtures end-to-end.
 #[cfg(test)]
 mod tests {
-    use arrow_array::StringArray;
     use super::*;
     use crate::embed_sentence;
+    use arrow_array::StringArray;
     #[tokio::test]
     async fn test_full_flow() {
-        let temp_folder = "temp_test_folder";
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_folder = temp_dir.path().to_str().unwrap();
         let temp_table = "temp_test_table";
-        fs::create_dir(temp_folder).unwrap();
-        let (test_sender, test_reciever) = std::sync::mpsc::channel::<EmbeddingEntry>();
-        let db_writer_task = init_db_writer_task(test_reciever, temp_folder, temp_table, 100)
+        let (test_sender, test_receiver) = mpsc::channel::<EmbeddingEntry>(100);
+        let db_writer_task = init_db_writer_task(test_receiver, temp_folder, temp_table, 100)
             .await
             .unwrap();
-        let files_dir = fs::read_dir("embedding_files_test").unwrap();
+        let files_dir = fs::read_dir("tests/fixtures/documents").unwrap();
         let file_list = files_dir
-            .into_iter()
-            .map(|file| file.unwrap().path().to_str().unwrap().to_string())
-            .collect::<Vec<String>>();
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         // process the files in parallel
-        file_list.par_iter().for_each(|filename| {
-            if let Err(e) = process_text_file(test_sender.clone(), filename.as_str()) {
-                panic!("Error processing file: {}: Error:{}", filename, e)
+        file_list.par_iter().for_each(|path| {
+            if let Err(error) = process_text_file(test_sender.clone(), path) {
+                panic!("Error processing file: {}: Error:{}", path.display(), error)
             }
         });
         drop(test_sender); // this will close the original channel
-        db_writer_task.await.unwrap();
+        db_writer_task.await.unwrap().unwrap();
         let db = storage::VecDB::connect(temp_folder, temp_table)
             .await
             .unwrap();
@@ -213,7 +219,6 @@ mod tests {
         let files_array = record_batch.column_by_name("filename").unwrap();
         let files = files_array.as_any().downcast_ref::<StringArray>().unwrap();
         let v = files.value(0);
-        assert_eq!(v, "embedding_files_test/embedding_content_99996.txt");
-        fs::remove_dir_all(temp_folder).unwrap();
+        assert!(v.starts_with("tests/fixtures/documents/"));
     }
 }

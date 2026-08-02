@@ -1,0 +1,32 @@
+[package]
+name = "doc-embedder"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+description = "A Rust pipeline for chunking documents, generating embeddings, and storing them in LanceDB."
+readme = "README.md"
+repository = "https://github.com/mkaydin/rag_indexing_rust"
+keywords = ["rag", "embeddings", "lancedb", "candle"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = "1.0.104"
+arrow-array = "58.0.0"
+arrow-schema = "58.0.0"
+candle = { version = "0.11.0", package = "candle-core" }
+candle-nn = "0.11.0"
+candle-transformers = "0.11.0"
+clap = { version = "4.6.5", features = ["derive"] }
+futures = "0.3.33"
+hf-hub = "0.4.3"
+lancedb = "0.33.0"
+rayon = "1.11.0"
+serde_json = "1.0.151"
+# Match Candle's tokenizer version to avoid compiling two tokenizer stacks.
+tokenizers = "0.22.2"
+tokio = { version = "1.53.0", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt", "std", "json"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
